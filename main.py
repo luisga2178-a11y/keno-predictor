@@ -4,8 +4,6 @@ from collections import Counter
 import datetime
 import os
 import requests
-from bs4 import BeautifulSoup
-import re
 
 # ---------------------------------------------------------
 # 1. CONFIGURACIÓN Y CARGA DE DATOS
@@ -21,68 +19,71 @@ else:
 print(f"Sorteos históricos previos en base de datos: {len(df)}")
 
 # ---------------------------------------------------------
-# 2. MÓDULO DE SCRAPING (EXTRACCIÓN EN VIVO EN KENO3.COM.CO)
+# 2. MÓDULO DE EXTRACCIÓN VÍA API OFICIAL (GANA-WEB)
 # ---------------------------------------------------------
-def capturar_nuevos_sorteos():
-    url = "https://www.keno3.com.co/results"
+def capturar_sorteos_api():
+    api_url = "https://backend-keno.gana-web.com/api/keno/draws"
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36',
+        'Accept': 'application/json, text/plain, */*'
     }
     
     nuevos = []
     try:
-        response = requests.get(url, headers=headers, timeout=15)
-        print(f"Conectando a {url}... Estado HTTP: {response.status_code}")
+        response = requests.get(api_url, headers=headers, timeout=12)
+        print(f"Conectando a API oficial ({api_url})... Estado HTTP: {response.status_code}")
         
         if response.status_code == 200:
-            soup = BeautifulSoup(response.text, 'html.parser')
-            filas = soup.find_all(['tr', 'div'], class_=re.compile(r'result|draw|row|item', re.I))
+            datos_json = response.json()
             
-            for fila in filas:
-                texto_fila = fila.get_text(separator=' ')
-                match_sorteo = re.search(r'\b(A\d{5})\b', texto_fila)
-                if match_sorteo:
-                    sorteo_id = match_sorteo.group(1)
+            # Obtener lista de sorteos recibidos
+            items = datos_json if isinstance(datos_json, list) else datos_json.get('data', datos_json.get('draws', datos_json.get('results', [])))
+            
+            for item in items:
+                # Extraer ID de sorteo (ej. A45034)
+                sorteo_raw = item.get('drawNumber', item.get('draw', item.get('id', item.get('sorteo', ''))))
+                sorteo_id = str(sorteo_raw)
+                if sorteo_id and not sorteo_id.startswith('A'):
+                    sorteo_id = f"A{sorteo_id}"
+                
+                # Extraer balotas ganadoras
+                balotas = item.get('winningNumbers', item.get('numbers', item.get('results', item.get('balotas', []))))
+                
+                if isinstance(balotas, str):
+                    balotas = [int(n) for n in balotas.replace(',', ' ').split() if n.isdigit()]
+                
+                if sorteo_id and len(balotas) >= 18:
+                    balotas_20 = sorted([int(b) for b in balotas[:20]])
+                    fecha_hoy = datetime.datetime.now().strftime("%d/%m/%Y")
+                    hora_ahora = datetime.datetime.now().strftime("%H:%M")
                     
-                    nums = [int(n) for n in re.findall(r'\b\d+\b', texto_fila)]
-                    balotas = [n for n in nums if 1 <= n <= 80 and n != int(sorteo_id[1:])]
+                    reg = {
+                        'Sorteo': sorteo_id,
+                        'Fecha': fecha_hoy,
+                        'Hora': hora_ahora,
+                        'Resultados': " ".join([f"{x:02d}" for x in balotas_20])
+                    }
+                    for i, b in enumerate(balotas_20):
+                        reg[f'B{i+1}'] = b
+                    nuevos.append(reg)
                     
-                    balotas_unicas = []
-                    for b in balotas:
-                        if b not in balotas_unicas:
-                            balotas_unicas.append(b)
-                            
-                    if len(balotas_unicas) >= 18:
-                        balotas_20 = sorted(balotas_unicas[:20])
-                        fecha_hoy = datetime.datetime.now().strftime("%d/%m/%Y")
-                        hora_ahora = datetime.datetime.now().strftime("%H:%M")
-                        
-                        reg = {
-                            'Sorteo': sorteo_id,
-                            'Fecha': fecha_hoy,
-                            'Hora': hora_ahora,
-                            'Resultados': " ".join([f"{x:02d}" for x in balotas_20])
-                        }
-                        for i, b in enumerate(balotas_20):
-                            reg[f'B{i+1}'] = b
-                        nuevos.append(reg)
-            print(f"🌐 Extracción web finalizada. Nuevos sorteos detectados: {len(nuevos)}")
+            print(f"✅ Sorteos extraídos correctamente desde la API: {len(nuevos)}")
         else:
-            print(f"⚠️ La web respondió con estado HTTP {response.status_code}.")
+            print(f"⚠️ La API respondió con estado HTTP: {response.status_code}")
     except Exception as e:
-        print(f"⚠️ Error conectando a la web de Keno: {e}")
+        print(f"⚠️ Error al consultar la API: {e}")
         
     return pd.DataFrame(nuevos)
 
-# Ejecutar actualización web
-df_nuevos = capturar_nuevos_sorteos()
+# Ejecutar actualización por API
+df_nuevos = capturar_sorteos_api()
 
 if not df_nuevos.empty:
     df = pd.concat([df_nuevos, df]).drop_duplicates(subset=['Sorteo']).reset_index(drop=True)
     df.to_csv(CSV_FILE, index=False)
-    print(f"✅ Base de datos actualizada con nuevos sorteos. Total registros: {len(df)}")
+    print(f"✅ Base de datos actualizada automáticamente. Total sorteos: {len(df)}")
 else:
-    print("ℹ️ No se encontraron sorteos nuevos en esta corrida o ya están al día.")
+    print("ℹ️ Base de datos al día o sin nuevos registros en la API.")
 
 # ---------------------------------------------------------
 # 3. MODELO DE PREDICCIÓN (ALGORITMO DE SCORING)
@@ -130,7 +131,7 @@ html_content = f"""<!DOCTYPE html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Predictor de Keno (Live)</title>
+    <title>Predictor de Keno (Live API)</title>
     <style>
         body {{ font-family: Arial, sans-serif; background-color: #f4f6f9; text-align: center; padding: 20px; }}
         .card {{ background: white; max-width: 600px; margin: 0 auto; padding: 20px; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); }}
@@ -143,7 +144,7 @@ html_content = f"""<!DOCTYPE html>
 <body>
     <div class="card">
         <h1>🎯 Pronóstico Automático Keno</h1>
-        <div class="sub">Conectado a Keno3 | Actualizado: {fecha_actual} | Base: {len(df)} sorteos</div>
+        <div class="sub">Conectado a API Oficial (Gana-Web) | Actualizado: {fecha_actual} | Base: {len(df)} sorteos</div>
         <h3>Top 20 Números Sugeridos:</h3>
         <div class="grid">
             {"".join([f'<div class="ball">{n:02d}</div>' for n in pronostico_final])}
