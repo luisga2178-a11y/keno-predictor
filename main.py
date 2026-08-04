@@ -3,9 +3,8 @@ import numpy as np
 from collections import Counter
 import datetime
 import os
-import requests
+import json
 import re
-from bs4 import BeautifulSoup
 
 # ---------------------------------------------------------
 # 1. CONFIGURACIÓN Y CARGA DE DATOS
@@ -21,7 +20,7 @@ else:
 print(f"Sorteos históricos previos en base de datos: {len(df)}")
 
 # ---------------------------------------------------------
-# 2. MÓDULO DE SCRAPING EN VIVO (PLAYWRIGHT HEADLESS)
+# 2. MÓDULO DE SCRAPING CON INTERCEPCIÓN DE RED (PLAYWRIGHT)
 # ---------------------------------------------------------
 def capturar_sorteos_playwright():
     nuevos = []
@@ -32,59 +31,64 @@ def capturar_sorteos_playwright():
         
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
-            # Configurar un contexto con dimensiones y User-Agent real
             context = browser.new_context(
                 user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                 viewport={'width': 1280, 'height': 800}
             )
             page = context.new_page()
+
+            # Interceptamos respuestas JSON de la red
+            json_responses = []
+
+            def handle_response(response):
+                if "draws" in response.url or "results" in response.url:
+                    try:
+                        if "application/json" in response.headers.get("content-type", ""):
+                            json_responses.append(response.json())
+                    except Exception:
+                        pass
+
+            page.on("response", handle_response)
+            
             page.goto("https://www.keno3.com.co/results", wait_until="networkidle", timeout=40000)
+            page.wait_for_timeout(4000)
             
-            # Esperar 5 segundos a que carguen las balotas en la interfaz
-            page.wait_for_timeout(5000)
-            content = page.content()
+            # Buscar en las respuestas JSON capturadas
+            for data in json_responses:
+                items = data if isinstance(data, list) else data.get('data', data.get('draws', data.get('results', [])))
+                if isinstance(items, list):
+                    for item in items:
+                        if isinstance(item, dict):
+                            sorteo_raw = item.get('drawNumber', item.get('draw', item.get('id', item.get('sorteo', ''))))
+                            sorteo_id = str(sorteo_raw)
+                            if sorteo_id and not sorteo_id.startswith('A'):
+                                sorteo_id = f"A{sorteo_id}"
+
+                            balotas = item.get('winningNumbers', item.get('numbers', item.get('results', item.get('balotas', []))))
+                            if isinstance(balotas, str):
+                                balotas = [int(n) for n in balotas.replace(',', ' ').split() if n.isdigit()]
+
+                            if sorteo_id and len(balotas) >= 18:
+                                balotas_20 = sorted([int(b) for b in balotas[:20]])
+                                fecha_hoy = datetime.datetime.now().strftime("%d/%m/%Y")
+                                hora_ahora = datetime.datetime.now().strftime("%H:%M")
+
+                                reg = {
+                                    'Sorteo': sorteo_id,
+                                    'Fecha': fecha_hoy,
+                                    'Hora': hora_ahora,
+                                    'Resultados': " ".join([f"{x:02d}" for x in balotas_20])
+                                }
+                                for idx, b in enumerate(balotas_20):
+                                    reg[f'B{idx+1}'] = b
+                                nuevos.append(reg)
+
             browser.close()
-            
-            soup = BeautifulSoup(content, 'html.parser')
-            texto_completo = soup.get_text(separator=' ')
-            
-            # Extraer bloques de sorteos (Patrón AXXXXX)
-            coincidencias = list(re.finditer(r'(A\d{5})', texto_completo))
-            
-            for i, match in enumerate(coincidencias):
-                sorteo_id = match.group(1)
-                start = match.start()
-                end = coincidencias[i+1].start() if i+1 < len(coincidencias) else start + 350
-                chunk = texto_completo[start:end]
-                
-                nums = [int(n) for n in re.findall(r'\b\d+\b', chunk)]
-                balotas = [n for n in nums if 1 <= n <= 80 and n != int(sorteo_id[1:])]
-                
-                balotas_unicas = []
-                for b in balotas:
-                    if b not in balotas_unicas:
-                        balotas_unicas.append(b)
-                        
-                if len(balotas_unicas) >= 18:
-                    balotas_20 = sorted(balotas_unicas[:20])
-                    fecha_hoy = datetime.datetime.now().strftime("%d/%m/%Y")
-                    hora_ahora = datetime.datetime.now().strftime("%H:%M")
-                    
-                    reg = {
-                        'Sorteo': sorteo_id,
-                        'Fecha': fecha_hoy,
-                        'Hora': hora_ahora,
-                        'Resultados': " ".join([f"{x:02d}" for x in balotas_20])
-                    }
-                    for idx, b in enumerate(balotas_20):
-                        reg[f'B{idx+1}'] = b
-                    nuevos.append(reg)
-                    
-            print(f"🌐 Extracción realizada. Sorteos capturados desde la web: {len(nuevos)}")
-            
+            print(f"🌐 Extracción realizada. Sorteos capturados desde la red: {len(nuevos)}")
+
     except Exception as e:
         print(f"⚠️ Nota ejecutando Playwright: {e}")
-        
+
     return pd.DataFrame(nuevos)
 
 # Ejecutar actualización web
