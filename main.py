@@ -4,6 +4,8 @@ from collections import Counter
 import datetime
 import os
 import requests
+import re
+from bs4 import BeautifulSoup
 
 # ---------------------------------------------------------
 # 1. CONFIGURACIÓN Y CARGA DE DATOS
@@ -19,42 +21,52 @@ else:
 print(f"Sorteos históricos previos en base de datos: {len(df)}")
 
 # ---------------------------------------------------------
-# 2. MÓDULO DE EXTRACCIÓN VÍA API OFICIAL (GANA-WEB)
+# 2. MÓDULO DE SCRAPING EN VIVO (PLAYWRIGHT HEADLESS)
 # ---------------------------------------------------------
-def capturar_sorteos_api():
-    api_url = "https://backend-keno.gana-web.com/api/keno/draws"
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'application/json, text/plain, */*',
-        'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
-        'Origin': 'https://www.keno3.com.co',
-        'Referer': 'https://www.keno3.com.co/',
-        'Sec-Fetch-Dest': 'empty',
-        'Sec-Fetch-Mode': 'cors',
-        'Sec-Fetch-Site': 'cross-site'
-    }
-    
+def capturar_sorteos_playwright():
     nuevos = []
+    
     try:
-        response = requests.get(api_url, headers=headers, timeout=12)
-        print(f"Conectando a API oficial ({api_url})... Estado HTTP: {response.status_code}")
+        from playwright.sync_api import sync_playwright
+        print("🌐 Iniciando navegador simulado Playwright...")
         
-        if response.status_code == 200:
-            datos_json = response.json()
-            items = datos_json if isinstance(datos_json, list) else datos_json.get('data', datos_json.get('draws', datos_json.get('results', [])))
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            # Configurar un contexto con dimensiones y User-Agent real
+            context = browser.new_context(
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                viewport={'width': 1280, 'height': 800}
+            )
+            page = context.new_page()
+            page.goto("https://www.keno3.com.co/results", wait_until="networkidle", timeout=40000)
             
-            for item in items:
-                sorteo_raw = item.get('drawNumber', item.get('draw', item.get('id', item.get('sorteo', ''))))
-                sorteo_id = str(sorteo_raw)
-                if sorteo_id and not sorteo_id.startswith('A'):
-                    sorteo_id = f"A{sorteo_id}"
+            # Esperar 5 segundos a que carguen las balotas en la interfaz
+            page.wait_for_timeout(5000)
+            content = page.content()
+            browser.close()
+            
+            soup = BeautifulSoup(content, 'html.parser')
+            texto_completo = soup.get_text(separator=' ')
+            
+            # Extraer bloques de sorteos (Patrón AXXXXX)
+            coincidencias = list(re.finditer(r'(A\d{5})', texto_completo))
+            
+            for i, match in enumerate(coincidencias):
+                sorteo_id = match.group(1)
+                start = match.start()
+                end = coincidencias[i+1].start() if i+1 < len(coincidencias) else start + 350
+                chunk = texto_completo[start:end]
                 
-                balotas = item.get('winningNumbers', item.get('numbers', item.get('results', item.get('balotas', []))))
-                if isinstance(balotas, str):
-                    balotas = [int(n) for n in balotas.replace(',', ' ').split() if n.isdigit()]
+                nums = [int(n) for n in re.findall(r'\b\d+\b', chunk)]
+                balotas = [n for n in nums if 1 <= n <= 80 and n != int(sorteo_id[1:])]
                 
-                if sorteo_id and len(balotas) >= 18:
-                    balotas_20 = sorted([int(b) for b in balotas[:20]])
+                balotas_unicas = []
+                for b in balotas:
+                    if b not in balotas_unicas:
+                        balotas_unicas.append(b)
+                        
+                if len(balotas_unicas) >= 18:
+                    balotas_20 = sorted(balotas_unicas[:20])
                     fecha_hoy = datetime.datetime.now().strftime("%d/%m/%Y")
                     hora_ahora = datetime.datetime.now().strftime("%H:%M")
                     
@@ -64,27 +76,26 @@ def capturar_sorteos_api():
                         'Hora': hora_ahora,
                         'Resultados': " ".join([f"{x:02d}" for x in balotas_20])
                     }
-                    for i, b in enumerate(balotas_20):
-                        reg[f'B{i+1}'] = b
+                    for idx, b in enumerate(balotas_20):
+                        reg[f'B{idx+1}'] = b
                     nuevos.append(reg)
                     
-            print(f"✅ Sorteos extraídos correctamente desde la API: {len(nuevos)}")
-        else:
-            print(f"⚠️ La API respondió con estado HTTP: {response.status_code}")
+            print(f"🌐 Extracción realizada. Sorteos capturados desde la web: {len(nuevos)}")
+            
     except Exception as e:
-        print(f"⚠️ Error al consultar la API: {e}")
+        print(f"⚠️ Nota ejecutando Playwright: {e}")
         
     return pd.DataFrame(nuevos)
 
-# Ejecutar actualización por API
-df_nuevos = capturar_sorteos_api()
+# Ejecutar actualización web
+df_nuevos = capturar_sorteos_playwright()
 
 if not df_nuevos.empty:
     df = pd.concat([df_nuevos, df]).drop_duplicates(subset=['Sorteo']).reset_index(drop=True)
     df.to_csv(CSV_FILE, index=False)
-    print(f"✅ Base de datos actualizada automáticamente. Total sorteos: {len(df)}")
+    print(f"✅ Base de datos actualizada con nuevos sorteos. Total registros: {len(df)}")
 else:
-    print("ℹ️ Base de datos al día o sin nuevos registros en la API.")
+    print("ℹ️ Base de datos al día o sin nuevos registros capturados.")
 
 # ---------------------------------------------------------
 # 3. MODELO DE PREDICCIÓN (ALGORITMO DE SCORING)
@@ -132,7 +143,7 @@ html_content = f"""<!DOCTYPE html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Predictor de Keno (Live API)</title>
+    <title>Predictor de Keno (Live)</title>
     <style>
         body {{ font-family: Arial, sans-serif; background-color: #f4f6f9; text-align: center; padding: 20px; }}
         .card {{ background: white; max-width: 600px; margin: 0 auto; padding: 20px; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); }}
@@ -145,7 +156,7 @@ html_content = f"""<!DOCTYPE html>
 <body>
     <div class="card">
         <h1>🎯 Pronóstico Automático Keno</h1>
-        <div class="sub">Conectado a API Oficial (Gana-Web) | Actualizado: {fecha_actual} | Base: {len(df)} sorteos</div>
+        <div class="sub">Conectado a Keno3 | Actualizado: {fecha_actual} | Base: {len(df)} sorteos</div>
         <h3>Top 20 Números Sugeridos:</h3>
         <div class="grid">
             {"".join([f'<div class="ball">{n:02d}</div>' for n in pronostico_final])}
